@@ -32,6 +32,8 @@ pub enum StrategyKind {
     Greedy,
     /// Beam-search valuation and target-aware playback.
     Search,
+    /// Evolved policy from the offline simulator (`crate::sim::policy`).
+    Evolved,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

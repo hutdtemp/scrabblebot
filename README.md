@@ -4,6 +4,12 @@ A Rust-only bot for [Clockwork Labs' ScrabbleBot](https://github.com/clockworkla
 It plays the upstream 1-second sealed-bid letter auctions, builds a private
 rack, and plays dictionary words for reward.
 
+> **Recommended: `--strategy evolved --genome genomes/v4.rl.json`** (the RL
+> policy deployed for the tournament). `--genome` also accepts an evolved
+> genome such as `genomes/ga7_latest.json`. Both are trained in an offline
+> simulator against Maincloud-derived opponents; see [TRAINING.md](TRAINING.md). The rest of this README describes the
+> original search baseline.
+
 The implementation is deliberately a **reasonable baseline**, not an ML
 project:
 

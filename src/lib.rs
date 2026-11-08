@@ -8,3 +8,4 @@ pub mod cli;
 pub mod core;
 pub mod live;
 pub mod module_bindings;
+pub mod sim;

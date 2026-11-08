@@ -4,3 +4,9 @@
 .env
 .DS_Store
 /telemetry/
+/data/maincloud/
+/runs/
+/.venv/
+/rlenv/target/
+__pycache__/
+*.tmp

@@ -6,8 +6,8 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, bail};
-use spacetimedb_sdk::Identity;
 use spacetimedb_sdk::table::TableLike;
+use spacetimedb_sdk::{DbContext, Identity, SubscriptionHandle as _};
 
 use crate::core::bag::BagModel;
 use crate::core::game::{elapsed_millis, micros_to_millis, placement, reconstruct_initial_rack};
@@ -48,6 +48,10 @@ pub struct BotRuntime {
     no_credential_since: Option<Instant>,
     was_connected: bool,
     last_join_lobby: Option<Instant>,
+    /// Our own participant/lobby rows (bot-scoped subscription).
+    bot_sub: Option<(u64, SubscriptionHandle)>,
+    /// Full rows for matches we are in, until their summary is written.
+    match_subs: HashMap<u64, SubscriptionHandle>,
 }
 
 impl BotRuntime {
@@ -76,6 +80,8 @@ impl BotRuntime {
             no_credential_since: None,
             was_connected: false,
             last_join_lobby: None,
+            bot_sub: None,
+            match_subs: HashMap::new(),
         }
     }
 
@@ -112,6 +118,9 @@ impl BotRuntime {
             self.bootstrap_error = None;
             self.claim_attempted = false;
             self.matches.clear();
+            // Handles belong to the previous connection.
+            self.bot_sub = None;
+            self.match_subs.clear();
             self.last_progress = Instant::now();
             while self.search_rx.try_recv().is_ok() {}
         }
@@ -176,12 +185,14 @@ impl BotRuntime {
             }
         }
 
+        self.manage_subscriptions(conn, shared, my_bot_id);
+
         let dirty = shared.take_dirty();
         if !dirty && !self.matches.is_empty() {
             return Ok(());
         }
 
-        let snapshots = build_all_snapshots(conn, my_bot_id)?;
+        let snapshots = build_all_snapshots(conn, my_bot_id, &self.summarized)?;
         let mut running_ids = HashSet::new();
         let mut progress = false;
         for snapshot in snapshots {
@@ -227,6 +238,9 @@ impl BotRuntime {
                         );
                         self.summarized.insert(match_id);
                         self.seen_running.remove(&match_id);
+                        if let Some(handle) = self.match_subs.remove(&match_id) {
+                            let _ = handle.unsubscribe();
+                        }
                         self.matches.remove(&match_id);
                         self.matches_run += 1;
                         progress = true;
@@ -252,6 +266,62 @@ impl BotRuntime {
             self.last_progress = Instant::now();
         }
         Ok(())
+    }
+
+    /// Keep a bot-scoped subscription, and a full per-match subscription for
+    /// every match we are in that is still running or not yet summarized.
+    fn manage_subscriptions(&mut self, conn: &DbConnection, shared: &Arc<Shared>, my_bot_id: u64) {
+        if self.bot_sub.as_ref().map(|(id, _)| *id) != Some(my_bot_id) {
+            let err = shared.clone();
+            let ok = shared.clone();
+            let handle = conn
+                .subscription_builder()
+                .on_applied(move |_| ok.mark_dirty())
+                .on_error(move |_, e| {
+                    err.record_error(None, None, None, "subscription", format!("{e:?}"))
+                })
+                .subscribe(vec![
+                    format!("SELECT * FROM match_participant WHERE bot_id = {my_bot_id}"),
+                    format!("SELECT * FROM lobby_member WHERE bot_id = {my_bot_id}"),
+                ]);
+            self.bot_sub = Some((my_bot_id, handle));
+        }
+        let wanted: Vec<u64> = conn
+            .db
+            .match_participant()
+            .iter()
+            .filter(|p| p.bot_id == my_bot_id && !self.summarized.contains(&p.match_id))
+            .filter(|p| {
+                conn.db
+                    .match_state()
+                    .id()
+                    .find(&p.match_id)
+                    .is_some_and(|m| {
+                        m.status == MatchStatus::Running || self.seen_running.contains(&m.id)
+                    })
+            })
+            .map(|p| p.match_id)
+            .collect();
+        for match_id in wanted {
+            if self.match_subs.contains_key(&match_id) {
+                continue;
+            }
+            let err = shared.clone();
+            let ok = shared.clone();
+            let handle = conn
+                .subscription_builder()
+                .on_applied(move |_| ok.mark_dirty())
+                .on_error(move |_, e| {
+                    err.record_error(Some(match_id), None, None, "subscription", format!("{e:?}"))
+                })
+                .subscribe(vec![
+                    format!("SELECT * FROM match_participant WHERE match_id = {match_id}"),
+                    format!("SELECT * FROM auction WHERE match_id = {match_id}"),
+                    format!("SELECT * FROM auction_result WHERE match_id = {match_id}"),
+                    format!("SELECT * FROM word_play WHERE match_id = {match_id}"),
+                ]);
+            self.match_subs.insert(match_id, handle);
+        }
     }
 
     fn handle_no_credential(
@@ -688,16 +758,21 @@ struct MatchSnapshot {
     my_participant: MatchParticipant,
     participants: Vec<MatchParticipant>,
     rack: Rack,
+    initial_rack: Rack,
     bag: BagModel,
     auctions: Vec<Auction>,
     results: Vec<AuctionResult>,
     my_word_plays: Vec<WordPlay>,
 }
 
-fn build_all_snapshots(conn: &DbConnection, my_bot_id: u64) -> Result<Vec<MatchSnapshot>> {
+fn build_all_snapshots(
+    conn: &DbConnection,
+    my_bot_id: u64,
+    summarized: &HashSet<u64>,
+) -> Result<Vec<MatchSnapshot>> {
     let mut snapshots = Vec::new();
     for participant in conn.db.match_participant().iter() {
-        if participant.bot_id != my_bot_id {
+        if participant.bot_id != my_bot_id || summarized.contains(&participant.match_id) {
             continue;
         }
         let Some(match_row) = conn.db.match_state().id().find(&participant.match_id) else {
@@ -795,6 +870,7 @@ fn build_snapshot(
         my_participant,
         participants,
         rack,
+        initial_rack,
         bag,
         auctions,
         results,
@@ -818,7 +894,12 @@ struct LiveMatch {
     last_round: u32,
     last_word_count: usize,
     last_result_count: usize,
+    /// Evolved-policy decision for the current state; recomputed only when
+    /// the auction, rack, balance or auction history changes.
+    evolved_cache: Option<(EvolvedKey, crate::sim::policy::Decision)>,
 }
+
+type EvolvedKey = (u64, [u8; 26], i64, usize);
 
 impl LiveMatch {
     fn new(snapshot: MatchSnapshot) -> Self {
@@ -838,6 +919,7 @@ impl LiveMatch {
             recorded_word_ids: HashSet::new(),
             traces: BTreeMap::new(),
             reducer_errors: 0,
+            evolved_cache: None,
         }
     }
 
@@ -1098,7 +1180,47 @@ fn drive_auctions(
             AuctionTrace::new(auction, round, kind, snapshot.my_participant.balance)
         });
 
-        if !trace.search_started {
+        if config.strategy == StrategyKind::Evolved {
+            if !trace.submitted
+                && let Some(genome) = &config.genome
+            {
+                let remaining = remaining_auction_ms(auction);
+                let decision =
+                    cached_decision(&mut live.evolved_cache, genome.as_ref(), snapshot, auction);
+                // The simulator plays words before bidding with the updated
+                // balance. Wait for pending plays to land unless time is short.
+                let words_pending = !decision.plays.is_empty() || live.pending_word.is_some();
+                let late = remaining <= config.submit_margin_ms as i64 + 150;
+                if !trace.search_started {
+                    trace.search_started = true;
+                    trace.fallback_bid = decision.bid;
+                }
+                if !words_pending || late {
+                    let amount = decision.bid.min(snapshot.my_participant.balance).max(0);
+                    trace.search_bid = Some(decision.bid);
+                    trace.final_bid = amount;
+                    trace.submitted = true;
+                    if amount > 0
+                        && remaining > 10
+                        && submit_bid(conn, shared, snapshot.match_row.id, auction.id, amount)
+                    {
+                        trace.submitted_at_ms = Some(now_millis());
+                        if !config.quiet {
+                            eprintln!(
+                                "[{}] match {} auction {} '{}' evolved bid {} (base {:.1}, corr {:+.1})",
+                                config.bot_name,
+                                snapshot.match_row.id,
+                                auction.id,
+                                trace.letter_str,
+                                amount,
+                                decision.base_bid,
+                                decision.correction
+                            );
+                        }
+                    }
+                }
+            }
+        } else if !trace.search_started {
             trace.search_started = true;
             let remaining = remaining_auction_ms(auction);
             let fallback = greedy_bid(
@@ -1215,6 +1337,10 @@ fn drive_word_play(
     if let Some(last) = live.last_word_attempt
         && last.elapsed() < Duration::from_millis(500)
     {
+        return;
+    }
+    if config.strategy == StrategyKind::Evolved {
+        drive_evolved_words(conn, shared, config, live, snapshot);
         return;
     }
     let decision = choose_play(
@@ -1474,6 +1600,160 @@ fn search_telemetry(result: &SearchResult) -> SearchTelemetry {
             .as_ref()
             .map(|word| word.word.clone()),
         best_now_with: result.best_now_with.as_ref().map(|word| word.word.clone()),
+    }
+}
+
+fn cached_decision(
+    cache: &mut Option<(EvolvedKey, crate::sim::policy::Decision)>,
+    genome: &dyn crate::sim::policy::Policy,
+    snapshot: &MatchSnapshot,
+    auction: &Auction,
+) -> crate::sim::policy::Decision {
+    let key = (
+        auction.id,
+        snapshot.rack.counts,
+        snapshot.my_participant.balance,
+        snapshot.results.len(),
+    );
+    if let Some((k, d)) = cache
+        && *k == key
+    {
+        return d.clone();
+    }
+    let d = evolved_decision(genome, snapshot, auction);
+    *cache = Some((key, d.clone()));
+    d
+}
+
+/// Run the simulator's policy on the authoritative snapshot.
+fn evolved_decision(
+    genome: &dyn crate::sim::policy::Policy,
+    snapshot: &MatchSnapshot,
+    auction: &Auction,
+) -> crate::sim::policy::Decision {
+    use crate::sim::engine::{AuctionKind as SimKind, AuctionRecord, Obs};
+    let words = crate::sim::words::WordIndex::bundled();
+    let participants = &snapshot.participants;
+    let me = participants
+        .iter()
+        .position(|p| p.bot_id == snapshot.my_participant.bot_id)
+        .unwrap_or(0);
+    let balances: Vec<i64> = participants.iter().map(|p| p.balance).collect();
+    let scores: Vec<i64> = participants.iter().map(|p| p.score).collect();
+    let history: Vec<AuctionRecord> = snapshot
+        .results
+        .iter()
+        .filter_map(|r| {
+            let letter = letter_index(*r.letter.as_bytes().first()?)? as u8;
+            let winner = r
+                .winner_bot_id
+                .and_then(|id| participants.iter().position(|p| p.bot_id == id))
+                .map(|i| i as u8);
+            Some(AuctionRecord {
+                letter,
+                winner,
+                paid: r.paid,
+                top_bid: 0,
+            })
+        })
+        .collect();
+    let letter = auction
+        .letter
+        .as_bytes()
+        .first()
+        .and_then(|b| letter_index(*b))
+        .unwrap_or(0);
+    let obs = Obs {
+        me,
+        rack: snapshot.rack.counts,
+        initial_rack: snapshot.initial_rack.counts,
+        balance: snapshot.my_participant.balance,
+        score: snapshot.my_participant.score,
+        letter,
+        bag_total: snapshot.match_row.bag_total,
+        balances: &balances,
+        scores: &scores,
+        history: &history,
+        kind: match auction_kind(&snapshot.match_row) {
+            AuctionKind::Vickrey => SimKind::Vickrey,
+            AuctionKind::FirstPrice => SimKind::FirstPrice,
+        },
+    };
+    genome.decide(&obs, &words)
+}
+
+/// Submit every word the evolved policy wants to play now. The words are
+/// disjoint by construction, so they are sent together; this matters in the
+/// final auction, where everything must land before the match ends.
+fn drive_evolved_words(
+    conn: &DbConnection,
+    shared: &Arc<Shared>,
+    config: &LiveConfig,
+    live: &mut LiveMatch,
+    snapshot: &MatchSnapshot,
+) {
+    let Some(genome) = &config.genome else { return };
+    let Some(auction) = snapshot.auctions.iter().find(|a| {
+        Some(a.id) == snapshot.match_row.current_auction_id && a.status == AuctionStatus::Open
+    }) else {
+        return;
+    };
+    let decision = cached_decision(&mut live.evolved_cache, genome.as_ref(), snapshot, auction);
+    if decision.plays.is_empty() {
+        return;
+    }
+    let words = crate::sim::words::WordIndex::bundled();
+    let match_id = snapshot.match_row.id;
+    let mut last = None;
+    for &id in &decision.plays {
+        let word = words.text(id).to_string();
+        let shared_for_callback = shared.clone();
+        let submitted = word.clone();
+        let res = conn
+            .reducers
+            .submit_word_then(match_id, word.clone(), move |_ctx, res| {
+                if let Err(message) = flatten_reducer_result(res) {
+                    shared_for_callback.record_error(
+                        Some(match_id),
+                        None,
+                        Some(submitted.clone()),
+                        "word",
+                        message,
+                    );
+                }
+            });
+        match res {
+            Ok(()) => {
+                if !config.quiet {
+                    eprintln!(
+                        "[{}] match {} playing '{}' (reward {})",
+                        config.bot_name,
+                        match_id,
+                        word,
+                        words.reward(id)
+                    );
+                }
+                last = Some(word);
+            }
+            Err(err) => {
+                shared.record_error(
+                    Some(match_id),
+                    None,
+                    Some(word),
+                    "word_send",
+                    format!("{err:?}"),
+                );
+            }
+        }
+    }
+    if let Some(word) = last {
+        live.pending_word = Some(PendingWord {
+            word,
+            submitted_at: Instant::now(),
+            submitted_at_micros: now_micros(),
+            source: PlayReason::GreedyBestNow,
+        });
+        live.last_word_attempt = Some(Instant::now());
     }
 }
 

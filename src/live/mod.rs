@@ -27,6 +27,33 @@ use crate::module_bindings::*;
 
 pub use state::BotRuntime;
 
+/// Base subscription: only small tables. Per-match rows (participants,
+/// auctions, results, word plays) are subscribed per match by the runtime
+/// (`BotRuntime::manage_subscriptions`). Maincloud holds tens of thousands of
+/// finished matches; loading them, or every live match, makes the client fall
+/// behind the server's message stream.
+fn subscribe_scoped(conn: &DbConnection, shared: &Arc<Shared>) {
+    let applied = shared.clone();
+    let err = shared.clone();
+    conn.subscription_builder()
+        .on_applied(move |_ctx| {
+            applied.subscription_applied.store(true, Ordering::SeqCst);
+            applied.mark_dirty();
+        })
+        .on_error(move |_ctx, e| {
+            err.record_error(None, None, None, "subscription", format!("{e:?}"));
+        })
+        .subscribe(vec![
+            "SELECT * FROM match_state".to_string(),
+            "SELECT * FROM lobby".to_string(),
+            "SELECT * FROM bot".to_string(),
+            "SELECT * FROM bot_credential".to_string(),
+            "SELECT * FROM team_member".to_string(),
+            "SELECT * FROM my_rack".to_string(),
+            "SELECT * FROM my_nonces".to_string(),
+        ]);
+}
+
 #[derive(Clone, Debug)]
 pub enum TelemetrySink {
     File(PathBuf),
@@ -42,6 +69,7 @@ pub struct LiveConfig {
     pub token_env: String,
     pub bot_name: String,
     pub strategy: StrategyKind,
+    pub genome: Option<Arc<dyn crate::sim::policy::Policy>>,
     pub matches: usize,
     pub telemetry: TelemetrySink,
     pub search: SearchConfig,
@@ -60,6 +88,7 @@ impl LiveConfig {
         match self.strategy {
             StrategyKind::Greedy => "greedy",
             StrategyKind::Search => "search",
+            StrategyKind::Evolved => "evolved",
         }
     }
 
@@ -285,15 +314,33 @@ fn run_connection(
         if shared.disconnected.load(Ordering::SeqCst) || !conn.is_active() {
             break;
         }
-        match conn.advance_one_message() {
-            Ok(true) => {}
-            Ok(false) => thread::sleep(Duration::from_millis(2)),
-            Err(err) => {
-                if !matches!(err, spacetimedb_sdk::Error::Disconnected) && !config.quiet {
-                    eprintln!("[{}] connection error: {err:?}", config.bot_name);
+        // Drain everything queued before ticking, so a burst of server
+        // messages can never leave the decision loop acting on stale state.
+        let mut processed = 0usize;
+        let mut failed = false;
+        loop {
+            match conn.advance_one_message() {
+                Ok(true) => {
+                    processed += 1;
+                    if processed >= 10_000 {
+                        break;
+                    }
                 }
-                break;
+                Ok(false) => break,
+                Err(err) => {
+                    if !matches!(err, spacetimedb_sdk::Error::Disconnected) && !config.quiet {
+                        eprintln!("[{}] connection error: {err:?}", config.bot_name);
+                    }
+                    failed = true;
+                    break;
+                }
             }
+        }
+        if failed {
+            break;
+        }
+        if processed == 0 {
+            thread::sleep(Duration::from_millis(2));
         }
 
         if last_tick.elapsed() >= Duration::from_millis(1) {
@@ -361,23 +408,7 @@ fn connect(config: &LiveConfig, shared: Arc<Shared>) -> Result<DbConnection> {
             }
 
             register_table_callbacks(conn, &shared_for_connect);
-            let subscribed = shared_for_connect.clone();
-            let subscription_error = shared_for_connect.clone();
-            conn.subscription_builder()
-                .on_applied(move |_ctx| {
-                    subscribed.subscription_applied.store(true, Ordering::SeqCst);
-                    subscribed.mark_dirty();
-                })
-                .on_error(move |_ctx, err| {
-                    subscription_error.record_error(
-                        None,
-                        None,
-                        None,
-                        "subscription",
-                        format!("{err:?}"),
-                    );
-                })
-                .subscribe_to_all_tables();
+            subscribe_scoped(conn, &shared_for_connect);
 
             if !config_for_connect.quiet {
                 eprintln!(

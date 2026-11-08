@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 
 use crate::core::search::{BeamScore, SearchConfig};
@@ -15,6 +15,9 @@ enum StrategyArg {
     Greedy,
     /// Adaptive-depth beam-search valuation and target-aware playback.
     Search,
+    /// Trained policy from the offline simulator (evolved genome or RL actor
+    /// `*.rl.json`); requires --genome.
+    Evolved,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -80,6 +83,10 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = StrategyArg::Search)]
     strategy: StrategyArg,
 
+    /// Genome JSON for --strategy evolved (e.g. runs/ga1/best.json).
+    #[arg(long)]
+    genome: Option<PathBuf>,
+
     /// Playback policy. Defaults to target for search and greedy for the
     /// no-lookahead baseline.
     #[arg(long, value_enum)]
@@ -124,6 +131,10 @@ struct Cli {
     /// Redeem a credential nonce on connect (local provisioning path).
     #[arg(long)]
     claim_nonce: Option<String>,
+
+    /// Read the claim nonce from a file instead (keeps it out of argv).
+    #[arg(long)]
+    claim_nonce_file: Option<PathBuf>,
 
     /// Local-only bootstrap: create this team if the identity has no credential.
     #[arg(long)]
@@ -197,6 +208,16 @@ impl Cli {
         let strategy = match self.strategy {
             StrategyArg::Greedy => StrategyKind::Greedy,
             StrategyArg::Search => StrategyKind::Search,
+            StrategyArg::Evolved => StrategyKind::Evolved,
+        };
+        let genome = match (&self.genome, strategy) {
+            (Some(path), _) => {
+                let policy = crate::sim::policy::load_policy(path)
+                    .with_context(|| format!("loading policy {}", path.display()))?;
+                Some(policy)
+            }
+            (None, StrategyKind::Evolved) => bail!("--strategy evolved requires --genome"),
+            (None, _) => None,
         };
         let playback = match self.playback {
             Some(PlaybackArg::Greedy) => PlaybackPolicy::Greedy,
@@ -204,6 +225,7 @@ impl Cli {
             None => match strategy {
                 StrategyKind::Greedy => PlaybackPolicy::Greedy,
                 StrategyKind::Search => PlaybackPolicy::TargetAware,
+                StrategyKind::Evolved => PlaybackPolicy::Greedy,
             },
         };
         let search = SearchConfig {
@@ -226,13 +248,23 @@ impl Cli {
             token_env: self.token_env,
             bot_name: self.bot_name,
             strategy,
+            genome,
             matches: self.matches,
             telemetry,
             search,
             strategy_config,
             submit_margin_ms: self.submit_margin_ms,
             match_timeout_secs: self.match_timeout_secs,
-            claim_nonce: self.claim_nonce,
+            claim_nonce: match (&self.claim_nonce, &self.claim_nonce_file) {
+                (Some(code), _) => Some(code.clone()),
+                (None, Some(path)) => Some(
+                    std::fs::read_to_string(path)
+                        .with_context(|| format!("reading {}", path.display()))?
+                        .trim()
+                        .to_string(),
+                ),
+                (None, None) => None,
+            },
             bootstrap_team: self.bootstrap_team,
             bootstrap_bot: self.bootstrap_bot,
             allow_remote: self.allow_remote,

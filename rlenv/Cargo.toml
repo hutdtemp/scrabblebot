@@ -1,0 +1,19 @@
+[package]
+name = "scrabble-rlenv"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Batched ScrabbleBot simulator environment for Python RL training"
+
+[lib]
+name = "scrabble_rlenv"
+crate-type = ["cdylib"]
+
+[dependencies]
+scrabblebot-bot = { path = ".." }
+pyo3 = { version = "0.27", features = ["extension-module", "abi3-py39"] }
+rayon = "1.10"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
